@@ -2,7 +2,8 @@
 #include <math.h>
 #include "../src/rspq/rspq_internal.h"
 #include "../src/rdpq/rdpq_internal.h"
-#include <rdpq_constants.h> 
+#include <rdpq_constants.h>
+#include <rspq_profile.h>
 
 #define BITS(v, b, e)  ((unsigned int)((v) << (63-(e)) >> (63-(e)+(b)))) 
 
@@ -2182,4 +2183,65 @@ void test_rdpq_texrect_passthrough(TestContext *ctx) {
     texrect = find_block_texrect_fixup(block);
     ASSERT_EQUAL_HEX(texrect, 0xd0040040, "expected fixup");
     rspq_block_free(block);
+}
+
+void test_rdpq_profile(TestContext *ctx)
+{
+#if RSPQ_PROFILE
+    RDPQ_INIT();
+
+    surface_t fb = surface_alloc(FMT_RGBA16, 64, 64);
+    DEFER(surface_free(&fb));
+
+    rspq_profile_start();
+    DEFER(rspq_profile_stop());
+
+    const int NUM_FRAMES = 8;
+    const int RECTS_PER_FRAME = 16;
+    for (int f = 0; f < NUM_FRAMES; f++) {
+        rdpq_set_color_image(&fb);
+        rdpq_set_mode_fill(RGBA32(f*16, 0, 0, 0xFF));
+        for (int i = 0; i < RECTS_PER_FRAME; i++)
+            rdpq_fill_rectangle(0, 0, 64, 64);
+        rdpq_sync_full(NULL, NULL);
+        rspq_profile_next_frame();
+    }
+    rspq_wait();
+
+    rspq_profile_data_t data;
+    rspq_profile_get_data(&data);
+    rspq_profile_dump();
+
+    ASSERT_EQUAL_UNSIGNED(data.frame_count, NUM_FRAMES, "wrong number of profiled frames");
+    ASSERT(data.total_ticks > 0, "no frame time recorded");
+    // DP_BUSY is a 24-bit counter of busy cycles on hardware, but some emulators
+    // (ares) only expose it as a 0/1 flag, so check it on hardware only.
+    if (!IN_EMULATOR) {
+        ASSERT(data.rdp_busy_ticks > 0, "no RDP busy time recorded");
+        ASSERT(data.rdp_busy_ticks <= data.total_ticks, "RDP busy time exceeds frame time");
+    }
+
+    rspq_profile_slot_t *rdpq_slot = NULL;
+    for (int i = 0; i < RSPQ_PROFILE_SLOT_COUNT; i++) {
+        if (data.slots[i].name && !strcmp(data.slots[i].name, "rsp_rdpq"))
+            rdpq_slot = &data.slots[i];
+    }
+    ASSERT(rdpq_slot != NULL, "rdpq overlay not found in the profile slots");
+    ASSERT(rdpq_slot->sample_count >= NUM_FRAMES * RECTS_PER_FRAME,
+        "too few rdpq samples: %llu", rdpq_slot->sample_count);
+    ASSERT(rdpq_slot->total_ticks > 0, "no rdpq busy time recorded");
+    ASSERT(rdpq_slot->total_ticks <= data.total_ticks, "rdpq busy time exceeds frame time");
+
+    ASSERT(data.slots[0].name != NULL, "builtin slot has no name");
+
+    // The sum of all slots must not exceed the frame time by more than a
+    // small measurement error.
+    uint64_t counted = 0;
+    for (int i = 0; i < RSPQ_PROFILE_SLOT_COUNT; i++)
+        counted += data.slots[i].total_ticks;
+    ASSERT(counted <= data.total_ticks + data.total_ticks / 10,
+        "slots account for more than the frame time: %llu > %llu", counted, data.total_ticks);
+#else
+    SKIP("libdragon was built without RSPQ_PROFILE");
+#endif
 }
