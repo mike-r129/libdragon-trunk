@@ -492,8 +492,23 @@ RDPQ_FixupAddress:
 RDPQCmd_SyncFull:
     # Wait until:
     #  * the previous SYNC_FULL interrupt has been processed by the CPU.
+#if RSPQ_PROFILE
+    mfc0 t1, COP0_DP_CLOCK
+#endif
     jal SpStatusWait
     li t2, SP_STATUS_SIG_RDPSYNCFULL
+#if RSPQ_PROFILE
+    # Account the time spent waiting for the previous SYNC_FULL to its own
+    # slot, and subtract it from the sample of the current command.
+    mfc0 t0, COP0_DP_CLOCK
+    lw t2, %lo(RSPQ_PROFILE_START_TIME)
+    li s0, %lo(RSPQ_PROFILESLOT_IDLE_RDPSYNCFULLMULTI)
+    subu t0, t1
+    and t0, 0xFFFFFF
+    add t2, t0
+    jal RSPQ_ProfileAccumulate
+     sw t2, %lo(RSPQ_PROFILE_START_TIME)
+#endif
 
     # Fetch the current syncpoint ID and put it into the state
     lw s0, %lo(RDPQ_RDRAM_SYNCPOINT_ADDR)

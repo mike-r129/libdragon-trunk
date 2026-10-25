@@ -646,7 +646,10 @@ void rspq_init(void)
     rspq_data.rspq_rdp_current = rspq_data.rspq_rdp_buffers[0];
     rspq_data.rspq_rdp_sentinel = rspq_data.rspq_rdp_buffers[0] + RDPQ_DYNAMIC_BUFFER_SIZE;
     rspq_data.rspq_ovl_table.data_rdram[0] = PhysicalAddr(dummy_overlay_state) | (0<<24);
-    
+#if RSPQ_PROFILE
+    rspq_data.rspq_profile_cur_slot = -1;
+#endif
+
     // Init syncpoints
     rspq_syncpoints_genid = 0;
     __rspq_syncpoints_done[0] = 0;
@@ -918,6 +921,7 @@ void rspq_overlay_unregister(uint32_t overlay_id)
         rspq_data.rspq_ovl_table.data_rdram[ovl_id + i] = 0;
         rspq_data.rspq_ovl_table.idmap[ovl_id + i] = 0;
     }
+    rspq_overlay_ucodes[ovl_id] = NULL;
 
     rspq_update_tables(false);
 }

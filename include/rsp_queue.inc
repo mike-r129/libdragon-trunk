@@ -99,6 +99,10 @@ _RSPQ_OVERLAY_HEADER:
     .short 0
     # 14: command base (filled in by C code)
     .short 0
+    #if RSPQ_PROFILE
+    # 16: DMEM offset of the profile slot of this overlay
+    .short _RSPQ_OVL_PROFILESLOT - _data_start
+    #endif
 	.align 1
 _RSPQ_OVERLAY_COMMAND_TABLE:
 .endm
@@ -111,6 +115,9 @@ _RSPQ_OVERLAY_COMMAND_TABLE:
 #define RSPQ_OH_TEXTADDR     8
 #define RSPQ_OH_TEXTSIZE     10
 #define RSPQ_OH_CMDBASE      14
+#if RSPQ_PROFILE
+#define RSPQ_OH_PROFILESLOT  16
+#endif
 
 ########################################################
 # RSPQ_BeginSavedState
@@ -134,9 +141,21 @@ _RSPQ_SAVED_STATE_START:
 # RSPQ_EndSavedState
 # 
 # Ends the definition of the saved overlay state.
+#
+# When the profiler is enabled (RSPQ_PROFILE), the profile slot
+# of the overlay is appended to the saved state here, so that it
+# is preserved across overlay switches. An overlay that needs to
+# place the slot itself can define RSPQ_PROFILE_MANUAL_SLOT and
+# put the _RSPQ_OVL_PROFILESLOT label (8 bytes, 8-byte aligned)
+# anywhere within its saved state.
 ########################################################
 .macro RSPQ_EndSavedState
     .align 3
+#if RSPQ_PROFILE && !RSPQ_PROFILE_MANUAL_SLOT
+_RSPQ_OVL_PROFILESLOT:
+    # Profiling data for this overlay: total ticks, sample count
+    .long 0, 0
+#endif
 _RSPQ_SAVED_STATE_END:
 .endm
 
@@ -357,6 +376,22 @@ RSPQ_RDRAM_PTR:               .long 0
 # ID of the current overlay
 RSPQ_CURRENT_OVL:             .half 0
 
+#if RSPQ_PROFILE
+# Profiler state (see rspq_profile.h). A slot is a pair of words:
+# accumulated ticks and number of samples. This must be kept in
+# sync with rsp_queue_t in rspq_internal.h.
+RSPQ_PROFILE_CUR_SLOT:        .long 0
+RSPQ_PROFILE_START_TIME:      .long 0
+RSPQ_PROFILE_DATA:
+    RSPQ_PROFILESLOT_IDLE_CPU:              .long 0,0
+    RSPQ_PROFILESLOT_IDLE_RDPBUSY:          .long 0,0
+    RSPQ_PROFILESLOT_IDLE_RDPSYNCFULL:      .long 0,0
+    RSPQ_PROFILESLOT_IDLE_RDPSYNCFULLMULTI: .long 0,0
+    RSPQ_PROFILESLOT_OVLSWITCH:             .long 0,0
+    RSPQ_PROFILESLOT_BUILTINS:              .long 0,0
+    # Padding to keep rsp_queue_t a multiple of 16 bytes
+                                            .long 0,0
+#endif
 
     .align 3
 RSPQ_DMEM_BUFFER:             .ds.b RSPQ_DMEM_BUFFER_SIZE
@@ -444,6 +479,25 @@ RSPQ_Loop:
     #define cmd_index t5    // referenced in rspq_assert_invalid_overlay
     #define cmd_desc  t6
 
+#if RSPQ_PROFILE
+    # Close the sample of the command that just finished: accumulate the
+    # elapsed time into the slot that was selected when it was dispatched.
+    mfc0 t0, COP0_DP_CLOCK
+    lw s0, %lo(RSPQ_PROFILE_CUR_SLOT)
+    lw t1, %lo(RSPQ_PROFILE_START_TIME)
+    bltz s0, 1f
+     subu t0, t1
+    jal RSPQ_ProfileAccumulate
+     nop
+    # Reset the current slot so we don't end up accumulating to it again.
+    # This could happen if highpri mode is entered right after this.
+    li s0, -1
+    sw s0, %lo(RSPQ_PROFILE_CUR_SLOT)
+1:
+    # Default slot for the next command: the builtins (overlay 0). Overlay
+    # commands replace it below with the slot stored in the overlay header.
+    li s0, %lo(RSPQ_PROFILESLOT_BUILTINS)
+#endif
 
     # Read SP_STATUS to check for highpri
     mfc0 t2, COP0_SP_STATUS
@@ -495,6 +549,11 @@ rspq_overlay_loaded:
     # Load command descriptor from overlay command table
     lhu cmd_desc, %lo(_ovl_data_start) + RSPQ_OVERLAY_HEADER_SIZE(cmd_index)
 
+    #if RSPQ_PROFILE
+    # Load the DMEM address of the profile slot of this overlay
+    lhu s0, %lo(_ovl_data_start) + RSPQ_OH_PROFILESLOT
+    #endif
+
 rspq_execute_command:
     # Load second command word                                  # Calculate vshift8
     lw a1, %lo(RSPQ_DMEM_BUFFER) + 0x4 (rspq_dmem_buf_ptr);     vsrl vshift, vshift8, 8
@@ -529,11 +588,26 @@ rspq_execute_command:
     # Jump to command. Set ra to the loop function, so that commands can 
     # either do "j RSPQ_Loop" or "jr ra" (or a tail call) to get back to the main loop
     sll cmd_desc, 2
+
+#if RSPQ_PROFILE
+    # Open a sample for this command. Opcode 0 means that the queue is empty
+    # and we are waiting for the CPU: divert it to the "Wait CPU" slot.
+    bnez a0, 1f
+     mfc0 t0, COP0_DP_CLOCK
+    li s0, %lo(RSPQ_PROFILESLOT_IDLE_CPU)
+1:
+    sw s0, %lo(RSPQ_PROFILE_CUR_SLOT)
+    sw t0, %lo(RSPQ_PROFILE_START_TIME)
+#endif
+
     jr cmd_desc
     li ra, %lo(RSPQ_Loop)
 
 
 rspq_load_overlay:
+#if RSPQ_PROFILE
+    mfc0 t3, COP0_DP_CLOCK
+#endif
 
     # Restore full command index before switching overlay
     addu cmd_index, t0
@@ -557,6 +631,14 @@ rspq_load_overlay:
     lhu t0, %lo(_ovl_data_start) + 12
     jal DMAIn
     li s4, %lo(_ovl_text_start)
+
+#if RSPQ_PROFILE
+    # Account the time spent switching overlay to its own slot
+    mfc0 t0, COP0_DP_CLOCK
+    subu t0, t3
+    jal RSPQ_ProfileAccumulate
+     li s0, %lo(RSPQ_PROFILESLOT_OVLSWITCH)
+#endif
 
     # Load new overlay command base
     lhu t0, %lo(_ovl_data_start) + 14
@@ -840,15 +922,65 @@ RSPQCmd_RdpWaitIdle:
     li t3, DP_STATUS_BUSY
 
 RSPQ_RdpWait:
+#if RSPQ_PROFILE
+    mfc0 t0, COP0_DP_CLOCK
+#endif
     mfc0 t2, COP0_DP_STATUS
 1:
     # Wait for selected RDP status bits to become 0.
     and t1, t2, t3
     bnez t1, 1b
     mfc0 t2, COP0_DP_STATUS
+#if RSPQ_PROFILE
+    # Measure the time we have been waiting for the RDP and save it to the
+    # "Wait RDP" slot. Also subtract this time from the sample that is
+    # currently being recorded, by adding it to the current start time.
+    mfc0 t1, COP0_DP_CLOCK
+
+    # If DP_STATUS_BUSY is in the mask, we are waiting for a SYNC_FULL:
+    # divert this to yet another special slot.
+    andi t2, t3, DP_STATUS_BUSY
+    bnez t2, 1f
+     li s0, %lo(RSPQ_PROFILESLOT_IDLE_RDPSYNCFULL)
+    li s0, %lo(RSPQ_PROFILESLOT_IDLE_RDPBUSY)
+1:
+    lw t2, %lo(RSPQ_PROFILE_START_TIME)
+    subu t1, t0
+    and t0, t1, 0xFFFFFF
+    # Masking the updated start time is not necessary here because the
+    # elapsed time is masked in RSPQ_ProfileAccumulate anyway
+    add t2, t0
+    j RSPQ_ProfileAccumulate
+     sw t2, %lo(RSPQ_PROFILE_START_TIME)
+#else
     jr ra
     nop
+#endif
     .endfunc
+
+#if RSPQ_PROFILE
+    #############################################################
+    # RSPQ_ProfileAccumulate
+    #
+    # Add a sample to a profile slot.
+    #
+    # ARGS:
+    #   t0: Sampled time (ticks)
+    #   s0: DMEM address of the slot
+    #############################################################
+    .func RSPQ_ProfileAccumulate
+RSPQ_ProfileAccumulate:
+    lw t2, 0x0(s0)
+    lw t1, 0x4(s0)
+    # We need to mask the time because the RDP clock wraps around at 24 bits
+    and t0, 0xFFFFFF
+    add t0, t2
+    addi t1, 1
+    sw t0, 0x0(s0)
+    jr ra
+     sw t1, 0x4(s0)
+    .endfunc
+#endif
 
 #include <rsp_dma.inc>
 #include <rsp_assert.inc>

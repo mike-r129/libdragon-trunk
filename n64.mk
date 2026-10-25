@@ -77,6 +77,17 @@ N64_CFLAGS = $(N64_C_AND_CXX_FLAGS) -std=gnu17
 N64_CXXFLAGS = $(N64_C_AND_CXX_FLAGS) -std=gnu++17
 N64_ASFLAGS = -mtune=vr4300 -march=vr4300 -mabi=o64 -Wa,--fatal-warnings -I$(N64_INCLUDEDIR)
 N64_RSPASFLAGS = -march=mips1 -mabi=32 -Wa,--fatal-warnings -I$(N64_INCLUDEDIR)
+
+# Set RSPQ_PROFILE=1 to enable the RSP queue profiler (see rspq_profile.h).
+# It changes the DMEM layout shared by all RSP overlays, so libdragon and the
+# ROM (including its own overlays) must be built with the same value.
+RSPQ_PROFILE ?= 0
+ifneq ($(RSPQ_PROFILE),0)
+N64_C_AND_CXX_FLAGS += -DRSPQ_PROFILE=$(RSPQ_PROFILE)
+N64_ASFLAGS += -DRSPQ_PROFILE=$(RSPQ_PROFILE)
+N64_RSPASFLAGS += -DRSPQ_PROFILE=$(RSPQ_PROFILE)
+endif
+
 N64_LDFLAGS = -g -L$(N64_LIBDIR) -ldragon -lm -ldragonsys -Tn64.ld --gc-sections --wrap __do_global_ctors
 N64_DSOLDFLAGS = --emit-relocs --unresolved-symbols=ignore-all --nmagic -T$(N64_LIBDIR)/dso.ld
 

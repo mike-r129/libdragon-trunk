@@ -187,9 +187,17 @@ typedef struct __attribute__((packed)) {
 } rspq_ovl_table_t;
 
 /**
+ * @brief Profiling data of a single slot (as stored in DMEM)
+ */
+typedef struct rspq_profile_slot_dmem_s {
+    uint32_t total_ticks;                       ///< Accumulated RCP ticks
+    uint32_t sample_count;                      ///< Number of samples
+} rspq_profile_slot_dmem_t;
+
+/**
  * @brief RSP Queue data in DMEM.
- * 
- * This structure is defined by rsp_queue.S, and represents the
+ *
+ * This structure is defined by rsp_queue.inc, and represents the
  * top portion of DMEM.
  */
 typedef struct rsp_queue_s {
@@ -212,6 +220,13 @@ typedef struct rsp_queue_s {
     uint32_t rspq_dram_addr;             ///< Current RDRAM address being processed
     uint16_t current_ovl;                ///< Current overlay ID
     uint16_t padding2;                   ///< Padding
+#if RSPQ_PROFILE
+    uint32_t rspq_profile_cur_slot;      ///< DMEM address of the slot being sampled (-1 if none)
+    uint32_t rspq_profile_start_time;    ///< DP_CLOCK value at the start of the current sample
+    rspq_profile_slot_dmem_t rspq_profile_cslots[RSPQ_PROFILE_CSLOT_COUNT]; ///< Common slots (waits, overlay switches)
+    rspq_profile_slot_dmem_t rspq_profile_builtin_slot; ///< Slot of the builtin commands (overlay 0)
+    uint32_t rspq_profile_padding[2];    ///< Padding
+#endif
  } __attribute__((aligned(16), packed)) rsp_queue_t;
 
 /** @brief Address of the RSPQ data header in DMEM (see #rsp_queue_t) */
