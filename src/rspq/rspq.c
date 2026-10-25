@@ -1068,10 +1068,30 @@ void rspq_highpri_begin(void)
     // add a command in case the previous epilog was skipped. Otherwise,
     // a dummy SIG_HIGHPRI_REQUESTED could stay on and eventually highpri
     // mode would enter once again.
-    rspq_append1(rspq_cur_pointer, RSPQ_CMD_WRITE_STATUS,
-        SP_WSTATUS_CLEAR_SIG_HIGHPRI_REQUESTED | SP_WSTATUS_SET_SIG_HIGHPRI_RUNNING);
+    //
+    // mvs64 hardening (2026-09-23): raise SIG_HIGHPRI_REQUESTED *before* that
+    // WRITE_STATUS can be seen by the RSP. Upstream appended the WRITE_STATUS
+    // first. If the RSP was still running highpri at the previous segment's
+    // end, it could follow the epilog-skip JUMP, fetch this WRITE_STATUS and
+    // execute it (consuming nothing) before the CPU's SP_STATUS store landed:
+    // exactly the dummy REQUESTED described above. At the next SWAP_BUFFERS
+    // epilog the kernel dropped to lowpri, saw REQUESTED, and re-entered
+    // highpri at the empty end of the highpri stream, where it slept with
+    // SIG_HIGHPRI_RUNNING set. Lowpri then starved until the next highpri
+    // segment; a CPU that filled the lowpri buffers first died in
+    // rspq_next_buffer (real hardware after 30+ minutes of play: "wait loop
+    // timed out", SP_STATUS=0x1403 = HALTED|BROKE|HIGHPRI_RUNNING|
+    // BUFDONE_HIGH, kernel PC at the idle break, current pointer == saved
+    // highpri pointer). Uncached stores reach the RCP in program order, so
+    // with REQUESTED raised first the WRITE_STATUS always executes after it
+    // and always consumes it. If raising it early makes the RSP enter highpri
+    // before the segment is written, it just finds the 0x00 terminator and
+    // sleeps until the flush below wakes it.
     MEMORY_BARRIER();
     *SP_STATUS = SP_WSTATUS_SET_SIG_HIGHPRI_REQUESTED;
+    MEMORY_BARRIER();
+    rspq_append1(rspq_cur_pointer, RSPQ_CMD_WRITE_STATUS,
+        SP_WSTATUS_CLEAR_SIG_HIGHPRI_REQUESTED | SP_WSTATUS_SET_SIG_HIGHPRI_RUNNING);
     rspq_flush_internal();
 }
 
@@ -1107,6 +1127,53 @@ void rspq_highpri_sync(void)
 bool rspq_in_highpri(void)
 {
     return (rspq_ctx == &highpri);
+}
+
+/**
+ * mvs64 hardening (2026-09-23): highpri wedge watchdog, the safety net
+ * behind the rspq_highpri_begin ordering fix.
+ *
+ * Called on every RSP_WAIT_LOOP iteration (rsp.c __rsp_check_assert), i.e.
+ * exactly while the CPU is blocked on RSP progress. The signature: RSP halted
+ * at the kernel idle break with SIG_HIGHPRI_RUNNING set and neither
+ * SIG_HIGHPRI_REQUESTED nor SIG_MORE pending, while the CPU has no highpri
+ * segment open. That state never resolves by itself: the RSP sleeps at the
+ * end of the highpri stream, and each lowpri flush only makes it refetch the
+ * same 0x00 terminator and break again. Held for 2ms (the legitimate
+ * transients last microseconds), recover by queueing an empty highpri
+ * segment (WRITE_STATUS + epilog) at that very position: the RSP runs it and
+ * returns to lowpri. A false positive is harmless, since an empty segment is
+ * a no-op. Recoveries are counted in __rspq_wedge_recoveries (telemetry).
+ */
+uint32_t __rspq_wedge_recoveries;
+
+void __rspq_wedge_check(void)
+{
+    static bool seen;
+    static uint32_t first_seen;
+    const uint32_t mask = SP_STATUS_HALTED | SP_STATUS_BROKE |
+        SP_STATUS_DMA_BUSY | SP_STATUS_IO_BUSY | SP_STATUS_SIG_MORE |
+        SP_STATUS_SIG_HIGHPRI_RUNNING | SP_STATUS_SIG_HIGHPRI_REQUESTED;
+    const uint32_t wedged = SP_STATUS_HALTED | SP_STATUS_BROKE |
+        SP_STATUS_SIG_HIGHPRI_RUNNING;
+
+    if (!rspq_initialized || rspq_ctx != &lowpri || rspq_block ||
+        (*SP_STATUS & mask) != wedged) {
+        seen = false;
+        return;
+    }
+    uint32_t now = TICKS_READ();
+    if (!seen) {
+        seen = true;
+        first_seen = now;
+        return;
+    }
+    if (TICKS_DISTANCE(first_seen, now) < (int32_t)TICKS_FROM_MS(2))
+        return;
+    seen = false;
+    __rspq_wedge_recoveries++;
+    rspq_highpri_begin();
+    rspq_highpri_end();
 }
 
 void rspq_block_begin(void)

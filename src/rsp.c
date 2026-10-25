@@ -180,8 +180,18 @@ void rsp_run(void)
 // This function is invoked by #RSP_WAIT_LOOP while waiting for the RSP
 // to finish a task, so that we immediately show a crash screen if the RSP
 // has hit an assert.
+// mvs64 hardening (2026-09-23): rspq highpri wedge watchdog (rspq.c). Weak so
+// programs that never link rspq still build.
+extern void __rspq_wedge_check(void) __attribute__((weak));
+
 void __rsp_check_assert(const char *file, int line, const char *func)
 {
+    // Every RSP_WAIT_LOOP iteration lands here, i.e. exactly while the CPU is
+    // blocked on RSP progress: the one place a wedged queue can be recovered
+    // before the loop times out into the crash screen.
+    if (__rspq_wedge_check)
+        __rspq_wedge_check();
+
     // If it's running, it has not asserted
     if (!(*SP_STATUS & (SP_STATUS_HALTED | SP_STATUS_BROKE)))
         return;
