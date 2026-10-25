@@ -995,6 +995,27 @@ static void rspq_flush_internal(void)
     MEMORY_BARRIER();
     *SP_STATUS = SP_WSTATUS_SET_SIG_MORE | SP_WSTATUS_CLEAR_HALT | SP_WSTATUS_CLEAR_BROKE;
     MEMORY_BARRIER();
+
+    // mvs64 hardening: the 10-nop guard above is open-loop. If the RSP is
+    // stalled by an in-flight IMEM/DMEM DMA while sitting in the
+    // mfc0->break window of RSPQCmd_WaitNewInput, BOTH writes above can
+    // land before the break executes, leaving the RSP halted+broke with
+    // SIG_MORE set and nobody left to wake it (observed deterministically:
+    // SP_STATUS=0x7003, PC at the kernel idle loop, queue current pointing
+    // at a 0x00 terminator while the CPU had appended more commands).
+    // Close the loop: if the RSP is still halted with SIG_MORE pending,
+    // clear HALT again until it actually wakes. Resuming after the break
+    // lands on the wakeup path by construction (the delay slot preloaded
+    // CLEAR_SIG_MORE into t0), so redundant clears are safe. Bounded spin
+    // so a genuinely crashed RSP still reaches the crash screen.
+    for (int i = 0; i < 256; i++) {
+        uint32_t status = *SP_STATUS;
+        if (!(status & SP_STATUS_HALTED) || !(status & SP_STATUS_SIG_MORE))
+            break;
+        MEMORY_BARRIER();
+        *SP_STATUS = SP_WSTATUS_CLEAR_HALT | SP_WSTATUS_CLEAR_BROKE;
+        MEMORY_BARRIER();
+    }
 }
 
 void rspq_flush(void)
