@@ -564,13 +564,14 @@ static void rspq_start(void)
 }
 
 /** @brief Initialize a rspq_ctx_t structure */
-static void rspq_init_context(rspq_ctx_t *ctx, int buf_size)
+static void rspq_init_context(rspq_ctx_t *ctx, int buf_size, int alloc_size)
 {
     memset(ctx, 0, sizeof(rspq_ctx_t));
-    ctx->buffers[0] = malloc_uncached(buf_size * sizeof(uint32_t));
-    ctx->buffers[1] = malloc_uncached(buf_size * sizeof(uint32_t));
-    memset(ctx->buffers[0], 0, buf_size * sizeof(uint32_t));
-    memset(ctx->buffers[1], 0, buf_size * sizeof(uint32_t));
+    if (alloc_size < buf_size) alloc_size = buf_size;
+    ctx->buffers[0] = malloc_uncached(alloc_size * sizeof(uint32_t));
+    ctx->buffers[1] = malloc_uncached(alloc_size * sizeof(uint32_t));
+    memset(ctx->buffers[0], 0, alloc_size * sizeof(uint32_t));
+    memset(ctx->buffers[1], 0, alloc_size * sizeof(uint32_t));
     ctx->buf_idx = 0;
     ctx->buf_size = buf_size;
     ctx->cur = ctx->buffers[0];
@@ -583,6 +584,19 @@ static void rspq_close_context(rspq_ctx_t *ctx)
     free_uncached(ctx->buffers[0]);
 }
 
+/**
+ * @brief App-overridable lowpri buffer size (mvs64 vendored patch).
+ *
+ * An application may define these (strong) to change the size of each lowpri
+ * RDRAM command buffer, in 32-bit words: __rspq_lowpri_buffer_words is the
+ * logical size (how far the CPU can run ahead of the RSP before blocking in
+ * rspq_next_buffer), __rspq_lowpri_alloc_words the allocated size (>= logical;
+ * lets A/B builds keep an identical heap layout). Undefined (the default),
+ * behaviour is exactly upstream's RSPQ_DRAM_LOWPRI_BUFFER_SIZE.
+ */
+extern int __rspq_lowpri_buffer_words __attribute__((weak));
+extern int __rspq_lowpri_alloc_words __attribute__((weak));
+
 void rspq_init(void)
 {
     // Do nothing if rspq_init has already been called
@@ -594,12 +608,18 @@ void rspq_init(void)
     rspq_cur_sentinel = NULL;
 
     // Allocate RSPQ contexts
-    rspq_init_context(&lowpri, RSPQ_DRAM_LOWPRI_BUFFER_SIZE);
+    int lowpri_words = RSPQ_DRAM_LOWPRI_BUFFER_SIZE;
+    if (&__rspq_lowpri_buffer_words && __rspq_lowpri_buffer_words >= RSPQ_DRAM_LOWPRI_BUFFER_SIZE)
+        lowpri_words = __rspq_lowpri_buffer_words;
+    int lowpri_alloc = lowpri_words;
+    if (&__rspq_lowpri_alloc_words && __rspq_lowpri_alloc_words > lowpri_alloc)
+        lowpri_alloc = __rspq_lowpri_alloc_words;
+    rspq_init_context(&lowpri, lowpri_words, lowpri_alloc);
     lowpri.sp_status_bufdone = SP_STATUS_SIG_BUFDONE_LOW;
     lowpri.sp_wstatus_set_bufdone = SP_WSTATUS_SET_SIG_BUFDONE_LOW;
     lowpri.sp_wstatus_clear_bufdone = SP_WSTATUS_CLEAR_SIG_BUFDONE_LOW;
 
-    rspq_init_context(&highpri, RSPQ_DRAM_HIGHPRI_BUFFER_SIZE);
+    rspq_init_context(&highpri, RSPQ_DRAM_HIGHPRI_BUFFER_SIZE, RSPQ_DRAM_HIGHPRI_BUFFER_SIZE);
     highpri.sp_status_bufdone = SP_STATUS_SIG_BUFDONE_HIGH;
     highpri.sp_wstatus_set_bufdone = SP_WSTATUS_SET_SIG_BUFDONE_HIGH;
     highpri.sp_wstatus_clear_bufdone = SP_WSTATUS_CLEAR_SIG_BUFDONE_HIGH;
